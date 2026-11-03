@@ -15,6 +15,7 @@ from queue import Empty, Queue, SimpleQueue
 from threading import Thread
 from typing import Any, Callable, Literal, Optional, Union
 from warnings import warn
+from weakref import WeakSet
 
 from .context import contextmanager
 from .cursor import Cursor
@@ -86,6 +87,7 @@ class Connection:
         self._connection: Optional[sqlite3.Connection] = None
         self._connector = connector
         self._tx: _TxQueue = SimpleQueue()
+        self._cursors: WeakSet[sqlite3.Cursor] = WeakSet()
         self._iter_chunk_size = iter_chunk_size
         self._thread = Thread(target=_connection_worker_thread, args=(self._tx,))
 
@@ -119,7 +121,7 @@ class Connection:
 
         def close_and_stop():
             if self._connection is not None:
-                self._connection.close()
+                self._close_connection()
                 self._connection = None
             return _STOP_RUNNING_SENTINEL
 
@@ -137,6 +139,18 @@ class Connection:
             raise ValueError("no active connection")
 
         return self._connection
+
+    def _new_cursor(
+        self, fn: Callable[..., sqlite3.Cursor], *args: Any
+    ) -> sqlite3.Cursor:
+        cursor = fn(*args)
+        self._cursors.add(cursor)
+        return cursor
+
+    def _close_connection(self) -> None:
+        for cursor in self._cursors:
+            cursor.close()
+        self._conn.close()
 
     def _execute_insert(self, sql: str, parameters: Any) -> Optional[sqlite3.Row]:
         cursor = self._conn.execute(sql, parameters)
@@ -186,7 +200,7 @@ class Connection:
     @contextmanager
     async def cursor(self) -> Cursor:
         """Create an aiosqlite cursor wrapping a sqlite3 cursor object."""
-        return Cursor(self, await self._execute(self._conn.cursor))
+        return Cursor(self, await self._execute(self._new_cursor, self._conn.cursor))
 
     async def commit(self) -> None:
         """Commit the current transaction."""
@@ -203,7 +217,7 @@ class Connection:
             return
 
         try:
-            await self._execute(self._conn.close)
+            await self._execute(self._close_connection)
         except Exception:
             LOG.info("exception occurred while closing connection")
             raise
@@ -220,7 +234,9 @@ class Connection:
         """Helper to create a cursor and execute the given query."""
         if parameters is None:
             parameters = []
-        cursor = await self._execute(self._conn.execute, sql, parameters)
+        cursor = await self._execute(
+            self._new_cursor, self._conn.execute, sql, parameters
+        )
         return Cursor(self, cursor)
 
     @contextmanager
@@ -246,13 +262,17 @@ class Connection:
         self, sql: str, parameters: Iterable[Iterable[Any]]
     ) -> Cursor:
         """Helper to create a cursor and execute the given multiquery."""
-        cursor = await self._execute(self._conn.executemany, sql, parameters)
+        cursor = await self._execute(
+            self._new_cursor, self._conn.executemany, sql, parameters
+        )
         return Cursor(self, cursor)
 
     @contextmanager
     async def executescript(self, sql_script: str) -> Cursor:
         """Helper to create a cursor and execute a user script."""
-        cursor = await self._execute(self._conn.executescript, sql_script)
+        cursor = await self._execute(
+            self._new_cursor, self._conn.executescript, sql_script
+        )
         return Cursor(self, cursor)
 
     async def interrupt(self) -> None:

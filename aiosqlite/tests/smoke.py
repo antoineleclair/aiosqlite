@@ -462,6 +462,36 @@ class SmokeTest(IsolatedAsyncioTestCase):
         # Check no more transaction pending
         self.assertEqual(db._tx.empty(), True)
 
+    async def test_close_with_unfinished_cursor(self):
+        db = await aiosqlite.connect(self.db)
+        await db.execute("create table foo (i integer)")
+        await db.execute("insert into foo (i) values (1)")
+        await db.commit()
+        cursor = await db.execute("select * from foo")
+        await db.close()
+
+        # the unfetched cursor must not keep the database locked
+        other = sqlite3.connect(self.db, timeout=0.5)
+        other.execute("update foo set i = i + 1")
+        other.commit()
+        other.close()
+        del cursor
+
+    async def test_stop_with_unfinished_cursor(self):
+        db = await aiosqlite.connect(self.db)
+        await db.execute("create table foo (i integer)")
+        await db.execute("insert into foo (i) values (1)")
+        await db.commit()
+        cursor = await db.execute("select * from foo")
+        await db.stop()
+
+        # the unfetched cursor must not keep the database locked
+        other = sqlite3.connect(self.db, timeout=0.5)
+        other.execute("update foo set i = i + 1")
+        other.commit()
+        other.close()
+        del cursor
+
     async def test_close_twice(self):
         db = await aiosqlite.connect(self.db)
 
